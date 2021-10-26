@@ -80,6 +80,13 @@ namespace Tanneryd.BulkOperations.EF6
             DoBulkDeleteNotExisting<T1, T2>(ctx, request);
         }
 
+        public static void BulkDeleteExisting<T1, T2>(
+            this DbContext ctx,
+            BulkDeleteRequest<T1> request)
+        {
+            DoBulkDeleteExisting<T1, T2>(ctx, request);
+        }
+
         /// <summary>
         /// The request object contains a mapping between properties in T1
         /// and properties in T2. BulkSelect will match all rows in the T2
@@ -589,6 +596,106 @@ namespace Tanneryd.BulkOperations.EF6
             return new List<T1>();
         }
 
+        private static void DoBulkDeleteExisting<T1, T2>(DbContext ctx, BulkDeleteRequest<T1> request)
+        {
+            if (request.Items.Count == 0) return;
+
+            Type t = typeof(T2);
+            var mappings = _mappingExtractor.GetMappings(ctx, t);
+            var tableName = mappings.TableName;
+            var columnMappings = mappings.ColumnMappingByPropertyName;
+            var itemPropertyByEntityProperty =
+                request.KeyPropertyMappings.ToDictionary(p => p.EntityPropertyName, p => p.ItemPropertyName);
+            var items = request.Items;
+            var conn = GetSqlConnection(ctx);
+
+            if (itemPropertyByEntityProperty.Count == 0)
+            {
+                throw new ArgumentException(
+                    "The KeyPropertyMappings request property must be set and contain at least one name.");
+            }
+
+            // Get EF key mappings for the entity properties we are selecting on.
+            var keyMappings = columnMappings.Values
+                .Where(m => request.KeyPropertyMappings.Any(kpm => kpm.EntityPropertyName == m.EntityProperty.Name))
+                .ToDictionary(m => m.EntityProperty.Name);
+
+            if (keyMappings.Count != 0)
+            {
+                var containsIdentityKey = keyMappings.Any(m =>
+                    m.Value.TableColumn.IsStoreGeneratedIdentity &&
+                    m.Value.TableColumn.TypeName != "uniqueidentifier");
+
+                // Create a temporary table with the supplied keys 
+                // as columns. We include the rowno column as well
+                // even though we do not need it. But, for some
+                // ungodly reason WriteToServer does nothing, on
+                // some platforms, if we omit it. Need to figure
+                // that out at some point.
+                var tempTableName = CreateTempTable(
+                    conn,
+                    request.Transaction,
+                    tableName,
+                    mappings.Discriminator,
+                    keyMappings.Select(m => m.Value.TableColumn.Name).ToArray(),
+                    IncludeRowNumber.Yes);
+
+                var properties = GetProperties(t);
+                var keyProperties = properties
+                    .Where(p => keyMappings.ContainsKey(p.Name)).ToArray();
+
+                var table = new DataTable();
+                var bulkCopy = CreateBulkCopy(
+                    table,
+                    keyProperties,
+                    keyMappings,
+                    conn,
+                    request.Transaction,
+                    tempTableName,
+                    mappings.Discriminator,
+                    containsIdentityKey ? SqlBulkCopyOptions.KeepIdentity : SqlBulkCopyOptions.Default,
+                    IncludeRowNumber.Yes);
+                if (containsIdentityKey) EnableIdentityInsert(tempTableName, conn, request.Transaction);
+
+                int i = 0;
+                var type = items[0].GetType();
+                foreach (var entity in items)
+                {
+                    var e = entity;
+                    var columnValues = new List<dynamic>();
+                    columnValues.AddRange(keyProperties.Select(p =>
+                        GetProperty(type, itemPropertyByEntityProperty[p.Name], e, DBNull.Value)));
+                    columnValues.Add(i++);
+                    table.Rows.Add(columnValues.ToArray());
+                }
+
+                bulkCopy.WriteToServer(table.CreateDataReader());
+
+                var condStatements = request.SqlConditions?.Select(c => $"[t0].[{c.ColumnName}] = {c.ColumnValue}") ?? Enumerable.Empty<string>();
+
+                var condStatementsSql = string.Join(" AND ", condStatements);
+                var conditionStatements = keyMappings.Values.Select(c =>
+                {
+                    return
+                        $"([t0].[{c.TableColumn.Name}] = [t1].[{c.TableColumn.Name}] OR ([t0].[{c.TableColumn.Name}] IS NULL AND [t1].[{c.TableColumn.Name}] IS NULL))";
+                });
+
+                var conditionStatementsSql = string.Join(" AND ", conditionStatements);
+                var query = $@"DELETE [t0] FROM {tableName.Fullname} [t0] JOIN {tempTableName} [t1] ON ({conditionStatementsSql})";
+
+                if (condStatementsSql.Length > 0)
+                {
+                    query += $" WHERE NOT ({condStatementsSql})";
+                }
+
+                var cmd = CreateSqlCommand(query, conn, request.Transaction, request.CommandTimeout);
+                cmd.ExecuteNonQuery();
+
+                DropTempTable(conn, request.Transaction, tempTableName);
+            }
+        }
+
+
         private static void DoBulkDeleteNotExisting<T1, T2>(DbContext ctx, BulkDeleteRequest<T1> request)
         {
             if (!request.Items.Any()) return;
@@ -958,6 +1065,10 @@ namespace Tanneryd.BulkOperations.EF6
                 .Where(m => selectedKeyMembers.Contains(m.TableColumn.Name))
                 .ToArray();
 
+            var selectedColumnMappings = columnMappings.Values
+                .Where(m => !selectedKeyMembers.Contains(m.TableColumn.Name))
+                .ToArray();
+
             if (selectedKeyMappings.Any())
             {
                 //
@@ -968,8 +1079,8 @@ namespace Tanneryd.BulkOperations.EF6
                 //
                 var modifiedColumnMappingCandidates = columnMappings.Values
                     .Where(m => !allKeyMembers.Contains(m.TableColumn.Name))
-                    .Select(m => m)
                     .ToArray();
+
                 if (updatedColumnNames.Any())
                 {
                     modifiedColumnMappingCandidates = modifiedColumnMappingCandidates
@@ -983,43 +1094,44 @@ namespace Tanneryd.BulkOperations.EF6
                 //
                 var conn = GetSqlConnection(ctx);
                 var tempTableName = FillTempTable(conn, entities, tableName, columnMappings, selectedKeyMappings,
-                    modifiedColumnMappings, transaction);
+                    request.InsertIfNew ? selectedColumnMappings : modifiedColumnMappings, transaction);
 
                 //
                 // Update the target table using the temp table we just created.
                 //
-                var setStatements =
-                    modifiedColumnMappings.Select(c => $"t0.[{c.TableColumn.Name}] = t1.[{c.TableColumn.Name}]");
-                var setStatementsSql = string.Join(" , ", setStatements);
                 var conditionStatements =
-                    selectedKeyMappings.Select(c => $"t0.[{c.TableColumn.Name}] = t1.[{c.TableColumn.Name}]");
+                    selectedKeyMappings.Select(c => c.TableColumn.Nullable ? $"((t0.[{c.TableColumn.Name}] IS NULL AND t1.[{c.TableColumn.Name}] IS NULL) OR (t0.[{c.TableColumn.Name}] = t1.[{c.TableColumn.Name}]))" : $"(t0.[{c.TableColumn.Name}] = t1.[{c.TableColumn.Name}])");
                 var conditionStatementsSql = string.Join(" AND ", conditionStatements);
-                var cmdBody = $@"UPDATE t0 SET {setStatementsSql}
-                                 FROM {tableName.Fullname} AS t0
-                                 INNER JOIN {tempTableName} AS t1 ON {conditionStatementsSql}
-                                ";
-                var cmd = CreateSqlCommand(cmdBody, conn, request.Transaction, request.CommandTimeout);
-                rowsAffected += cmd.ExecuteNonQuery();
+                var cmdBody =
+                    $"MERGE INTO {tableName.Fullname} t0 USING {tempTableName} AS t1 ON {conditionStatementsSql}";
+
+                if (modifiedColumnMappings.Length > 0)
+                {
+                    var setStatements =
+                        modifiedColumnMappings.Select(c => $"t0.[{c.TableColumn.Name}] = t1.[{c.TableColumn.Name}]");
+                    var setStatementsSql = string.Join(" , ", setStatements);
+
+                    cmdBody += $" WHEN MATCHED THEN UPDATE SET {setStatementsSql}";
+                }
 
                 if (request.InsertIfNew)
                 {
-                    var columns = columnMappings.Values
-                        .Where(m => !primaryKeyMembers.Contains(m.TableColumn.Name))
-                        .Select(m => m.TableColumn.Name)
-                        .ToArray();
-                    var columnNames = string.Join(",", columns.Select(c => $"[{c}]"));
-                    var t0ColumnNames = string.Join(",", columns.Select(c => $"[t0].[{c}]"));
-                    cmdBody = $@"INSERT INTO {tableName.Fullname}
-                             SELECT {columnNames}
-                             FROM {tempTableName}
-                             EXCEPT
-                             SELECT {t0ColumnNames}
-                             FROM {tempTableName} AS t0
-                             INNER JOIN {tableName.Fullname} AS t1 ON {conditionStatementsSql}            
-                            ";
-                    cmd = CreateSqlCommand(cmdBody, conn, request.Transaction, request.CommandTimeout);
-                    rowsAffected += cmd.ExecuteNonQuery();
+                    var columns = selectedKeyMappings
+                        .Concat(selectedColumnMappings)
+                        .Where(m => m.TableColumn.StoreGeneratedPattern == StoreGeneratedPattern.None)
+                        .ToList();
+
+                    var columnNames = string.Join(",", columns.Select(c => $"[{c.TableColumn.Name}]"));
+                    var t1ColumnNames = string.Join(",", columns.Select(c => $"[t1].[{c.TableColumn.Name}]"));
+                    cmdBody += $" WHEN NOT MATCHED THEN INSERT ({columnNames}) VALUES ({t1ColumnNames})";
                 }
+
+                cmdBody += ";";
+
+                var cmd = CreateSqlCommand(cmdBody, conn, request.Transaction, request.CommandTimeout);
+                rowsAffected += cmd.ExecuteNonQuery();
+
+
 
                 //
                 // Clean up. Delete the temp table.
