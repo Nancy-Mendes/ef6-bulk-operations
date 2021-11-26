@@ -26,3 +26,4 @@ namespace Tanneryd.BulkOperations.EF6.NET47.ModelFirst.Tests.Models.EF
         public virtual ICollection<BatchInvoiceItem> Invoices { get; set; }
     }
 }
+sd
